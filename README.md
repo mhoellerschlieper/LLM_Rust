@@ -1,9 +1,13 @@
-# ExpChat.ai LLM (Rust) &mdash; Minimal Transformer with BPE Tokenizer, Training, and Checkpoints
+# LLM (Rust) &mdash; Minimal Transformer with BPE Tokenizer, Training, and Checkpoints
 
 This repository describes and implements a self-contained Large Language Model (LLM) in Rust, consisting of a compact Transformer architecture, a Byte Pair Encoding (BPE) tokenizer, a simple training loop for pretraining and instruction tuning, and a robust checkpoint format that consistently saves and loads both the tokenizer and model parameters.
 
 The project addresses the practical necessity of developing a complete LLM as a closed system in which data pipeline, tokenization, model, optimization, inference, and persistence are integrated into a reproducible workflow. It deliberately prioritizes a transparent implementation suitable for expert analysis, debugging, and incremental extension.
 
+Implemented features:
+- Temperature, top-k, top-p
+- Multi-head attention
+  
 ## Contents
 
 - Project overview
@@ -177,11 +181,11 @@ A complete LLM in terms of scalability, robust evaluation paths, and production-
    - Validation split, early stopping, and metrics
    - Mixed precision and more stable initializations
 3. Inference quality
-   - Temperature, top-k, top-p
+   
    - Repetition penalty and stopping criteria
    - KV cache for efficient autoregression
 4. Model architecture
-   - Multi-head attention
+   
    - Positional embeddings or RoPE
    - Attention mask handling for padding and batches
 5. Persistence and compatibility
@@ -190,6 +194,7 @@ A complete LLM in terms of scalability, robust evaluation paths, and production-
 6. Testability and verification
    - Unit tests for tokenizer, softmax stability, checkpoint roundtrip
    - Golden tests for deterministic runs
+
 
 
 
