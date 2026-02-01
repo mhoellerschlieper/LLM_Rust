@@ -652,8 +652,442 @@ impl Layer for SelfAttention {
     }
 }
 
+// ---------------------------
+// MultiHeadSelfAttention
+// ---------------------------
+pub struct MultiHeadSelfAttention {
+    i_embedding_dim: usize,
+    i_num_heads: usize,
+    i_head_dim: usize,
+
+    // Projection matrices: [embedding_dim, embedding_dim]
+    w_q: Array2<f32>,
+    w_k: Array2<f32>,
+    w_v: Array2<f32>,
+    w_o: Array2<f32>,
+
+    // Cache for backward
+    cached_input: Option<Array2<f32>>,
+    cached_q_all: Option<Array2<f32>>,
+    cached_k_all: Option<Array2<f32>>,
+    cached_v_all: Option<Array2<f32>>,
+    cached_concat: Option<Array2<f32>>,
+    cached_weights: Option<Vec<Array2<f32>>>, // per head: [seq, seq]
+
+    opt_w_q: Adam,
+    opt_w_k: Adam,
+    opt_w_v: Adam,
+    opt_w_o: Adam,
+}
+
+impl MultiHeadSelfAttention {
+    pub fn new(i_embedding_dim: usize, i_num_heads: usize) -> Self {
+        // Validation, fail early.
+        if i_embedding_dim == 0 {
+            panic!("embedding_dim_must_be_positive");
+        }
+        if i_num_heads == 0 {
+            panic!("num_heads_must_be_positive");
+        }
+        if i_embedding_dim % i_num_heads != 0 {
+            panic!("embedding_dim_must_be_divisible_by_num_heads");
+        }
+
+        let i_head_dim = i_embedding_dim / i_num_heads;
+
+        let mut rng = rand::rng();
+        let d_std = (2.0 / (i_embedding_dim as f32).max(1.0)).sqrt();
+        let normal = Normal::new(0.0, d_std).unwrap();
+
+        Self {
+            i_embedding_dim,
+            i_num_heads,
+            i_head_dim,
+
+            w_q: Array2::from_shape_fn((i_embedding_dim, i_embedding_dim), |_| normal.sample(&mut rng)),
+            w_k: Array2::from_shape_fn((i_embedding_dim, i_embedding_dim), |_| normal.sample(&mut rng)),
+            w_v: Array2::from_shape_fn((i_embedding_dim, i_embedding_dim), |_| normal.sample(&mut rng)),
+            w_o: Array2::from_shape_fn((i_embedding_dim, i_embedding_dim), |_| normal.sample(&mut rng)),
+
+            cached_input: None,
+            cached_q_all: None,
+            cached_k_all: None,
+            cached_v_all: None,
+            cached_concat: None,
+            cached_weights: None,
+
+            opt_w_q: Adam::new((i_embedding_dim, i_embedding_dim)),
+            opt_w_k: Adam::new((i_embedding_dim, i_embedding_dim)),
+            opt_w_v: Adam::new((i_embedding_dim, i_embedding_dim)),
+            opt_w_o: Adam::new((i_embedding_dim, i_embedding_dim)),
+        }
+    }
+
+    fn softmax(a_scores: &Array2<f32>) -> Array2<f32> {
+        math::softmax_rows(a_scores)
+    }
+
+    fn softmax_backward(a_softmax: &Array2<f32>, a_grad_out: &Array2<f32>) -> Array2<f32> {
+        // Row-wise Jacobian-vector product for softmax: dS = S * (dY - sum(dY * S))
+        let mut a_grad_in = a_softmax.clone();
+        for i in 0..a_softmax.nrows() {
+            let a_row = a_softmax.row(i);
+            let a_grow = a_grad_out.row(i);
+
+            let d_dot: f32 = a_row
+                .iter()
+                .zip(a_grow.iter())
+                .map(|(&y, &dy)| y * dy)
+                .sum();
+
+            for j in 0..a_softmax.ncols() {
+                a_grad_in[[i, j]] = a_softmax[[i, j]] * (a_grad_out[[i, j]] - d_dot);
+            }
+        }
+        a_grad_in
+    }
+
+    fn split_heads(&self, a_x: &Array2<f32>) -> Result<Vec<Array2<f32>>, String> {
+        // a_x: [seq, embedding] -> vec heads [seq, head_dim]
+        if a_x.ncols() != self.i_embedding_dim {
+            return Err("mhsa_split_heads_dim_mismatch".to_string());
+        }
+
+        let i_seq_len = a_x.nrows();
+        let mut v_heads: Vec<Array2<f32>> = Vec::with_capacity(self.i_num_heads);
+
+        for i_h in 0..self.i_num_heads {
+            let i_start = i_h * self.i_head_dim;
+            let i_end = i_start + self.i_head_dim;
+            let a_view = a_x.slice(ndarray::s![.., i_start..i_end]).to_owned();
+
+            if a_view.nrows() != i_seq_len || a_view.ncols() != self.i_head_dim {
+                return Err("mhsa_split_heads_slice_error".to_string());
+            }
+            v_heads.push(a_view);
+        }
+
+        Ok(v_heads)
+    }
+
+    fn concat_heads(&self, v_heads: &[Array2<f32>]) -> Result<Array2<f32>, String> {
+        if v_heads.len() != self.i_num_heads {
+            return Err("mhsa_concat_heads_count_mismatch".to_string());
+        }
+
+        let i_seq_len = v_heads[0].nrows();
+        for a_h in v_heads.iter() {
+            if a_h.nrows() != i_seq_len || a_h.ncols() != self.i_head_dim {
+                return Err("mhsa_concat_heads_shape_mismatch".to_string());
+            }
+        }
+
+        let mut a_out = Array2::<f32>::zeros((i_seq_len, self.i_embedding_dim));
+        for i_h in 0..self.i_num_heads {
+            let i_start = i_h * self.i_head_dim;
+            let i_end = i_start + self.i_head_dim;
+            let mut a_slice = a_out.slice_mut(ndarray::s![.., i_start..i_end]);
+            a_slice.assign(&v_heads[i_h]);
+        }
+
+        Ok(a_out)
+    }
+
+    fn apply_causal_mask_inplace(a_scores: &mut Array2<f32>) {
+        let i_seq_len = a_scores.nrows();
+        for i in 0..i_seq_len {
+            for j in (i + 1)..i_seq_len {
+                a_scores[[i, j]] = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    fn attention_head_forward(
+        &self,
+        a_q: &Array2<f32>,
+        a_k: &Array2<f32>,
+        a_v: &Array2<f32>,
+    ) -> (Array2<f32>, Array2<f32>) {
+        // Returns (head_out, weights)
+        let d_scale = (self.i_head_dim as f32).sqrt().max(1e-12);
+
+        let mut a_scores = a_q.dot(&a_k.t()) / d_scale;
+        Self::apply_causal_mask_inplace(&mut a_scores);
+
+        let a_weights = Self::softmax(&a_scores);
+        let a_out = a_weights.dot(a_v);
+
+        (a_out, a_weights)
+    }
+}
+
+impl Layer for MultiHeadSelfAttention {
+    fn layer_type(&self) -> &str {
+        "MultiHeadSelfAttention"
+    }
+
+    fn forward(&mut self, a_input: &Array2<f32>) -> Array2<f32> {
+        // a_input: [seq, embedding_dim]
+        if a_input.nrows() == 0 || a_input.ncols() == 0 {
+            return a_input.clone();
+        }
+        if a_input.ncols() != self.i_embedding_dim {
+            return Array2::<f32>::zeros((0, 0));
+        }
+
+        // Cache input.
+        self.cached_input = Some(a_input.clone());
+
+        // Project.
+        let a_q_all = a_input.dot(&self.w_q);
+        let a_k_all = a_input.dot(&self.w_k);
+        let a_v_all = a_input.dot(&self.w_v);
+
+        self.cached_q_all = Some(a_q_all.clone());
+        self.cached_k_all = Some(a_k_all.clone());
+        self.cached_v_all = Some(a_v_all.clone());
+
+        // Split heads.
+        let v_q = match self.split_heads(&a_q_all) {
+            Ok(v) => v,
+            Err(_) => return Array2::<f32>::zeros((0, 0)),
+        };
+        let v_k = match self.split_heads(&a_k_all) {
+            Ok(v) => v,
+            Err(_) => return Array2::<f32>::zeros((0, 0)),
+        };
+        let v_v = match self.split_heads(&a_v_all) {
+            Ok(v) => v,
+            Err(_) => return Array2::<f32>::zeros((0, 0)),
+        };
+
+        // Per-head attention.
+        let mut v_head_out: Vec<Array2<f32>> = Vec::with_capacity(self.i_num_heads);
+        let mut v_weights: Vec<Array2<f32>> = Vec::with_capacity(self.i_num_heads);
+
+        for i_h in 0..self.i_num_heads {
+            let (a_h_out, a_w) = self.attention_head_forward(&v_q[i_h], &v_k[i_h], &v_v[i_h]);
+            v_head_out.push(a_h_out);
+            v_weights.push(a_w);
+        }
+
+        self.cached_weights = Some(v_weights);
+
+        // Concat and output projection.
+        let a_concat = match self.concat_heads(&v_head_out) {
+            Ok(a) => a,
+            Err(_) => return Array2::<f32>::zeros((0, 0)),
+        };
+        self.cached_concat = Some(a_concat.clone());
+
+        let a_proj = a_concat.dot(&self.w_o);
+
+        // Residual.
+        a_proj + a_input
+    }
+
+    fn backward(&mut self, a_grads: &Array2<f32>, d_lr: f32) -> Array2<f32> {
+        // Correct backward for MHSA with causal scaled dot product attention.
+        // Shapes:
+        // a_input: [seq, emb]
+        // a_grads: [seq, emb] gradient wrt output of (proj + residual)
+        //
+        // Output:
+        // grad wrt input: [seq, emb]
+
+        // Safety checks.
+        if !d_lr.is_finite() || d_lr <= 0.0 {
+            return a_grads.clone();
+        }
+
+        let a_input = match self.cached_input.as_ref() {
+            Some(x) => x,
+            None => return a_grads.clone(),
+        };
+        let a_q_all = match self.cached_q_all.as_ref() {
+            Some(x) => x,
+            None => return a_grads.clone(),
+        };
+        let a_k_all = match self.cached_k_all.as_ref() {
+            Some(x) => x,
+            None => return a_grads.clone(),
+        };
+        let a_v_all = match self.cached_v_all.as_ref() {
+            Some(x) => x,
+            None => return a_grads.clone(),
+        };
+        let a_concat = match self.cached_concat.as_ref() {
+            Some(x) => x,
+            None => return a_grads.clone(),
+        };
+        let v_weights = match self.cached_weights.as_ref() {
+            Some(v) => v,
+            None => return a_grads.clone(),
+        };
+
+        if a_input.raw_dim() != a_grads.raw_dim() {
+            return a_grads.clone();
+        }
+
+        // Residual path: output = proj + input
+        // So grad splits: dL/dproj = a_grads, dL/dinput_residual = a_grads
+        let a_grad_proj = a_grads;
+
+        // Output projection: proj = concat * w_o
+        let a_grad_w_o = a_concat.t().dot(a_grad_proj);
+        let a_grad_concat = a_grad_proj.dot(&self.w_o.t()); // [seq, emb]
+
+        // Split grad_concat to heads.
+        let v_grad_head_out = match self.split_heads(&a_grad_concat) {
+            Ok(v) => v,
+            Err(_) => return a_grads.clone(),
+        };
+
+        // Split q/k/v to heads.
+        let v_q = match self.split_heads(a_q_all) {
+            Ok(v) => v,
+            Err(_) => return a_grads.clone(),
+        };
+        let v_k = match self.split_heads(a_k_all) {
+            Ok(v) => v,
+            Err(_) => return a_grads.clone(),
+        };
+        let v_v = match self.split_heads(a_v_all) {
+            Ok(v) => v,
+            Err(_) => return a_grads.clone(),
+        };
+
+        // Accumulate per-head grads.
+        let mut v_grad_q: Vec<Array2<f32>> = Vec::with_capacity(self.i_num_heads);
+        let mut v_grad_k: Vec<Array2<f32>> = Vec::with_capacity(self.i_num_heads);
+        let mut v_grad_v: Vec<Array2<f32>> = Vec::with_capacity(self.i_num_heads);
+
+        let d_scale = (self.i_head_dim as f32).sqrt().max(1e-12);
+        let i_seq_len = a_input.nrows();
+
+        for i_h in 0..self.i_num_heads {
+            let a_q = &v_q[i_h];
+            let a_k = &v_k[i_h];
+            let a_v = &v_v[i_h];
+            let a_w = &v_weights[i_h]; // [seq, seq]
+            let a_grad_h_out = &v_grad_head_out[i_h]; // [seq, head_dim]
+
+            // head_out = W * V
+            // dW = dO * V^T
+            // dV = W^T * dO
+            let a_grad_w = a_grad_h_out.dot(&a_v.t()); // [seq, seq]
+            let a_grad_v_h = a_w.t().dot(a_grad_h_out); // [seq, head_dim]
+
+            // W = softmax(scores)
+            // dScores = softmax_backward(W, dW)
+            let mut a_grad_scores = Self::softmax_backward(a_w, &a_grad_w); // [seq, seq]
+
+            // Apply causal mask gradient: masked positions are constant -inf in forward,
+            // therefore treat gradients there as zero to avoid spurious updates.
+            for i in 0..i_seq_len {
+                for j in (i + 1)..i_seq_len {
+                    a_grad_scores[[i, j]] = 0.0;
+                }
+            }
+
+            // scores = (Q K^T) / scale
+            // dQ = dScores * K / scale
+            // dK = dScores^T * Q / scale
+            let a_grad_q_h = a_grad_scores.dot(a_k) / d_scale;
+            let a_grad_k_h = a_grad_scores.t().dot(a_q) / d_scale;
+
+            v_grad_q.push(a_grad_q_h);
+            v_grad_k.push(a_grad_k_h);
+            v_grad_v.push(a_grad_v_h);
+        }
+
+        // Concat per-head grads to embedding space.
+        let a_grad_q_all = match self.concat_heads(&v_grad_q) {
+            Ok(a) => a,
+            Err(_) => return a_grads.clone(),
+        };
+        let a_grad_k_all = match self.concat_heads(&v_grad_k) {
+            Ok(a) => a,
+            Err(_) => return a_grads.clone(),
+        };
+        let a_grad_v_all = match self.concat_heads(&v_grad_v) {
+            Ok(a) => a,
+            Err(_) => return a_grads.clone(),
+        };
+
+        // Linear projections:
+        // Q = X * w_q, K = X * w_k, V = X * w_v
+        // dW = X^T * dY
+        // dX = dY * W^T
+        let a_grad_w_q = a_input.t().dot(&a_grad_q_all);
+        let a_grad_w_k = a_input.t().dot(&a_grad_k_all);
+        let a_grad_w_v = a_input.t().dot(&a_grad_v_all);
+
+        let a_grad_x_from_q = a_grad_q_all.dot(&self.w_q.t());
+        let a_grad_x_from_k = a_grad_k_all.dot(&self.w_k.t());
+        let a_grad_x_from_v = a_grad_v_all.dot(&self.w_v.t());
+
+        // Total grad wrt input is sum of:
+        // - residual path
+        // - projections paths via q/k/v
+        let a_grad_input_total = a_grads.clone() + a_grad_x_from_q + a_grad_x_from_k + a_grad_x_from_v;
+
+        // Update parameters.
+        self.opt_w_o.step(&mut self.w_o, &a_grad_w_o, d_lr);
+        self.opt_w_q.step(&mut self.w_q, &a_grad_w_q, d_lr);
+        self.opt_w_k.step(&mut self.w_k, &a_grad_w_k, d_lr);
+        self.opt_w_v.step(&mut self.w_v, &a_grad_w_v, d_lr);
+
+        a_grad_input_total
+    }
+
+    fn parameters(&self) -> usize {
+        self.w_q.len() + self.w_k.len() + self.w_v.len() + self.w_o.len()
+    }
+
+    fn get_parameters_flat(&self) -> Vec<f32> {
+        let mut v: Vec<f32> = Vec::new();
+        v.extend(self.w_q.iter().copied());
+        v.extend(self.w_k.iter().copied());
+        v.extend(self.w_v.iter().copied());
+        v.extend(self.w_o.iter().copied());
+        v
+    }
+
+    fn set_parameters_flat(&mut self, v_params: &[f32]) -> Result<usize, String> {
+        let i_needed = self.w_q.len() + self.w_k.len() + self.w_v.len() + self.w_o.len();
+        if v_params.len() < i_needed {
+            return Err("checkpoint_not_enough_params_multi_head_self_attention".to_string());
+        }
+
+        let mut i_pos: usize = 0;
+
+        for i in 0..self.w_q.len() {
+            self.w_q.as_slice_mut().unwrap()[i] = v_params[i_pos];
+            i_pos += 1;
+        }
+        for i in 0..self.w_k.len() {
+            self.w_k.as_slice_mut().unwrap()[i] = v_params[i_pos];
+            i_pos += 1;
+        }
+        for i in 0..self.w_v.len() {
+            self.w_v.as_slice_mut().unwrap()[i] = v_params[i_pos];
+            i_pos += 1;
+        }
+        for i in 0..self.w_o.len() {
+            self.w_o.as_slice_mut().unwrap()[i] = v_params[i_pos];
+            i_pos += 1;
+        }
+
+        Ok(i_needed)
+    }
+}
+
+// ---------------------------
+// TransformerBlock update
+// ---------------------------
 pub struct TransformerBlock {
-    attention: SelfAttention,
+    attention: MultiHeadSelfAttention,
     feed_forward: FeedForward,
     norm1: LayerNorm,
     norm2: LayerNorm,
@@ -661,8 +1095,12 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     pub fn new(i_embedding_dim: usize, i_hidden_dim: usize) -> Self {
+        // Expert default: embedding_dim 128 is divisible by 4.
+        // If EMBEDDING_DIM changes, new() panics early if invalid.
+        let i_num_heads: usize = 4;
+
         Self {
-            attention: SelfAttention::new(i_embedding_dim),
+            attention: MultiHeadSelfAttention::new(i_embedding_dim, i_num_heads),
             feed_forward: FeedForward::new(i_embedding_dim, i_hidden_dim),
             norm1: LayerNorm::new(i_embedding_dim),
             norm2: LayerNorm::new(i_embedding_dim),

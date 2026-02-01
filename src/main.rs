@@ -60,9 +60,11 @@ fn build_llm_from_tokenizer(bpe: BpeTokenizer) -> Llm {
 fn main() {
     let s_prompt = String::from("User: How do mountains form?");
 
+    let mut s_checkpoint_path: String = "../../checkpoints/llm_checkpoint.json".to_string();
+
     let dataset = Dataset::new(
-        "data/pretraining_data.json",
-        "data/chat_training_data.json",
+        "../../data/pretraining_data.json",
+        "../../data/chat_training_data.json",
         DatasetType::JSON,
     );
 
@@ -95,7 +97,7 @@ fn main() {
     );
     println!("Total parameters: {}", llm.total_parameters());
 
-    let mut s_checkpoint_path: String = "checkpoints/llm_checkpoint.json".to_string();
+    
 
     loop {
         println!("\n--- Menu Mode ---");

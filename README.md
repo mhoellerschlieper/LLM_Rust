@@ -191,24 +191,5 @@ A complete LLM in terms of scalability, robust evaluation paths, and production-
    - Unit tests for tokenizer, softmax stability, checkpoint roundtrip
    - Golden tests for deterministic runs
 
-## License and Contact
-
-Author: Marcus Schlieper  
-Company: ExpChat.ai  
-Address: Epscheider Str21 58339 Breckerfeld  
-Email: mschlieper@ylook.de  
-Phone: 49 2338 8748862  
-Mobile: 49 15115751864  
-
-Short description: The AI chat client for SMEs from Breckerfeld in the Sauerland region. RPA, AI agents, AI internet research, AI knowledge management&mdash;we bring AI to the SME sector.
-
-## References
-
-text
-Goodfellow, I., Bengio, Y., &amp; Courville, A. (2016). Deep learning. MIT Press.
-
-Holtzman, A., Buys, J., Du, L., Forbes, M., &amp; Choi, Y. (2020). The curious case of neural text degeneration. In International Conference on Learning Representations (ICLR).
-
-Pascanu, R., Mikolov, T., &amp; Bengio, Y. (2013). On the difficulty of training recurrent neural networks. In Proceedings of the 30th International Conference on Machine Learning (ICML).
 
 
